@@ -335,7 +335,7 @@ class YoloDetector:
         self.model_type  = 'darknet'   # 'darknet' or 'yolov8'
 
     def load(self, cfg_file: str = '', weights_file: str = '', names_file: str = '',
-             use_gpu: bool = False, onnx_file: str = '') -> bool:
+             use_gpu: bool = False, onnx_file: str = '', force_gpu: bool = False) -> bool:
         # Load class names
         with open(names_file, 'r') as f:
             self.class_names = [l.strip() for l in f if l.strip()]
@@ -359,19 +359,23 @@ class YoloDetector:
             print("[ERROR] Network is empty.", file=sys.stderr)
             return False
 
-        # Backend selection: try GPU, fallback to CPU
+        # Backend selection
         if use_gpu:
             try:
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                # Quick probe
                 dummy = np.zeros((self.net_size, self.net_size, 3), np.uint8)
                 blob  = cv2.dnn.blobFromImage(dummy, 1/255.0,
                             (self.net_size, self.net_size), swapRB=True, crop=False)
                 self.net.setInput(blob)
                 self.net.forward(self.net.getUnconnectedOutLayersNames())
-                print("[INFO] Backend: CUDA GPU")
+                n_dev = cv2.cuda.getCudaEnabledDeviceCount()
+                print(f"[INFO] Backend: CUDA GPU  (devices available: {n_dev})")
             except Exception as e:
+                if force_gpu:
+                    print(f"[ERROR] GPU requested but CUDA init failed: {e}", file=sys.stderr)
+                    print("[ERROR] Install OpenCV with CUDA support, or run with --cpu", file=sys.stderr)
+                    return False
                 print(f"[WARN] GPU init failed ({e}), falling back to CPU.")
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
@@ -1043,7 +1047,8 @@ def _derive_model_name(onnx_file: str, cfg_file: str) -> str:
     return "Unknown"
 
 
-def _load_model_bg(preset: dict, conf: float, nms: float, result: list) -> None:
+def _load_model_bg(preset: dict, conf: float, nms: float, result: list,
+                   use_gpu: bool = True, force_gpu: bool = False) -> None:
     """Background thread: load a model preset into result[0]/result[1]."""
     new_det = YoloDetector()
     new_det.conf_thresh = conf
@@ -1054,10 +1059,10 @@ def _load_model_bg(preset: dict, conf: float, nms: float, result: list) -> None:
     try:
         if has_onnx:
             ok = new_det.load(names_file=preset['names'],
-                              onnx_file=preset['onnx'], use_gpu=False)
+                              onnx_file=preset['onnx'], use_gpu=use_gpu, force_gpu=force_gpu)
         elif preset.get('cfg') and preset.get('weights'):
             ok = new_det.load(preset['cfg'], preset['weights'],
-                              preset['names'], use_gpu=False)
+                              preset['names'], use_gpu=use_gpu, force_gpu=force_gpu)
     except Exception as e:
         print(f"[SWITCH] Load error: {e}")
     result[0] = new_det if ok else None
@@ -1147,7 +1152,7 @@ def in_roi(pt: Tuple[float,float], roi_pts) -> bool:
 #  main
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(description="Vehicle Counter (Mac/Linux CPU)")
+    p = argparse.ArgumentParser(description="Vehicle Counter")
     p.add_argument("input",          help="Video file path, RTSP URL, or webcam index (0)")
     p.add_argument("--cfg",          default="", help="YOLOv4 .cfg file")
     p.add_argument("--weights",      default="", help="YOLOv4 .weights file")
@@ -1160,9 +1165,13 @@ def parse_args():
     p.add_argument("--csv",          default="vehicle_counts.csv", help="CSV output path")
     p.add_argument("--out",          default="", help="Save annotated video to file")
     p.add_argument("--nowin",  action="store_true", help="Headless mode")
-    p.add_argument("--cpu",    action="store_true", help="Force CPU backend")
     p.add_argument("--stats",  default="live_stats.json",
                    help="Write live stats JSON for dashboard (default: live_stats.json)")
+    backend = p.add_mutually_exclusive_group()
+    backend.add_argument("--gpu", action="store_true",
+                         help="Force CUDA GPU backend (exit if GPU not available)")
+    backend.add_argument("--cpu", action="store_true",
+                         help="Force CPU backend")
     return p.parse_args()
 
 
@@ -1249,11 +1258,22 @@ def main():
     detector.conf_thresh = args.conf
     detector.nms_thresh  = args.nms
     detector.net_size    = args.size
+    use_gpu   = not args.cpu          # True unless --cpu is set
+    force_gpu = args.gpu              # True only when --gpu is explicit
+    if args.cpu:
+        print("[INFO] Backend: CPU (forced by --cpu)")
+    elif args.gpu:
+        print("[INFO] Backend: GPU (forced by --gpu, will exit if CUDA unavailable)")
+    else:
+        print("[INFO] Backend: GPU preferred, auto-fallback to CPU")
+
     if using_onnx:
-        if not detector.load(names_file=names_file, onnx_file=onnx_file, use_gpu=not args.cpu):
+        if not detector.load(names_file=names_file, onnx_file=onnx_file,
+                             use_gpu=use_gpu, force_gpu=force_gpu):
             sys.exit(1)
     else:
-        if not detector.load(active_cfg, active_weights, names_file, use_gpu=not args.cpu):
+        if not detector.load(active_cfg, active_weights, names_file,
+                             use_gpu=use_gpu, force_gpu=force_gpu):
             sys.exit(1)
 
     # --- Load scene config ---
@@ -1494,7 +1514,7 @@ def main():
                     _sw_result = [None, None]
                     _sw_thread = threading.Thread(
                         target=_load_model_bg,
-                        args=(_p, detector.conf_thresh, detector.nms_thresh, _sw_result),
+                        args=(_p, detector.conf_thresh, detector.nms_thresh, _sw_result, use_gpu, force_gpu),
                         daemon=True,
                     )
                     _sw_thread.start()
